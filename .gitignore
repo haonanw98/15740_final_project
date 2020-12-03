@@ -1,0 +1,12 @@
+ChampSim/pin.log
+ChampSim/prefetcher/l1i_prefetcher.cc
+ChampSim/prefetcher/l1d_prefetcher.cc
+ChampSim/prefetcher/l2c_prefetcher.cc
+ChampSim/prefetcher/llc_prefetcher.cc
+ChampSim/branch/branch_predictor.cc
+ChampSim/replacement/llc_replacement.cc
+
+ChampSim/inc/champsim.h.bak
+
+ChampSim/bin/
+ChampSim/obj/

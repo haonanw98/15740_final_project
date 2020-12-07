@@ -9,12 +9,15 @@
  */
 #define SA_CHUNK_SIZE 256
 #define SA_SIZE 4096
-#define TU_COUNT 16
-#define PREFETCH_DEGREE 3
+#define TU_COUNT 1024
+#define PREFETCH_DEGREE 1
 
 // map physical addr to index in sa
 std::unordered_map<uint64_t, int> ps_amc;
 uint64_t sa_alloc_counter;
+uint64_t pf_boundary_blocked_cnt = 0;
+uint64_t pf_alloc_blocked_cnt = 0;
+uint64_t pf_alloc_cnt = 0;
 
 class training_unit {
   public:
@@ -25,12 +28,12 @@ class training_unit {
     uint64_t last_addr;
 
     // use LRU to evict old IP trackers
-    uint32_t lru;
+    // uint32_t lru;
 
     training_unit () {
         ip = 0;
         last_addr = 0;
-        lru = 0;
+        // lru = 0;
     };
 };
 
@@ -47,50 +50,83 @@ class sa_entry {
     };
 };
 
-std::vector<sa_entry> sa(SA_SIZE); // store the physical addr
+std::vector<sa_entry> sa; // store the physical addr
+std::vector<sa_entry> sa_chunk(SA_CHUNK_SIZE);
 // track TU_COUNT number of PCs
-training_unit tu[TU_COUNT];
+// std::vector<training_unit> tu(TU_COUNT);
+std::unordered_map<uint64_t, training_unit> tu;
+std::vector<long int> link_sa_index;
+
+void touch(long int sa_index, uint64_t addr)
+{
+    if (sa[sa_index].valid)
+    {
+        if (sa[sa_index].counter > 0)
+        {
+            sa[sa_index].counter--;
+        }
+        else
+        { // replace with the new address
+            ps_amc.erase(sa[sa_index].addr);
+            sa[sa_index].addr = addr;
+            ps_amc.insert(make_pair(addr, sa_index));
+        }
+    }
+    else
+    {
+        sa[sa_index].valid = true;
+        sa[sa_index].addr = addr;
+        sa[sa_index].counter = 0;
+        ps_amc.insert(make_pair(addr, sa_index));
+    }
+}
 
 void CACHE::l2c_prefetcher_initialize() 
 {
     cout << "CPU " << cpu << " L2C ISB prefetcher" << endl;
     sa_alloc_counter = 0;
-    for (int i=0; i<TU_COUNT; i++)
-        tu[i].lru = i;
+    // for (int i=0; i<TU_COUNT; i++)
+    //     tu[i].lru = i;
 }
 
 uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
 {
     // check for a tracker hit
-    int index = -1;
-    for (index=0; index<TU_COUNT; index++) {
-        if (tu[index].ip == ip)
-            break;
-    }
+    // int index = -1;
+    // for (index=0; index<TU_COUNT; index++) {
+    //     if (tu[index].ip == ip)
+    //         break;
+    // }
 
     // this is a new IP that doesn't have a tracker yet, so allocate one
-    if (index == TU_COUNT) {
+    // if (index == TU_COUNT) {
+    if (tu.find(ip) == tu.end()) {
 
-        for (index=0; index<TU_COUNT; index++) {
-            if (tu[index].lru == (TU_COUNT-1))
-                break;
-        }
+        // for (index=0; index<TU_COUNT; index++) {
+        //     if (tu[index].lru == (TU_COUNT-1))
+        //         break;
+        // }
 
-        tu[index].ip = ip;
-        tu[index].last_addr = addr;
+        tu[ip].ip = ip;
+        tu[ip].last_addr = addr;
 
 
-        for (int i=0; i<TU_COUNT; i++) {
-            if (tu[i].lru < tu[index].lru)
-                tu[i].lru++;
-        }
-        tu[index].lru = 0;
+        // for (int i=0; i<TU_COUNT; i++) {
+        //     if (tu[i].lru < tu[index].lru)
+        //         tu[i].lru++;
+        // }
+        // tu[index].lru = 0;
 
         return metadata_in;
-    } else if (tu[index].last_addr != addr) { // if not the same addr in a row, add pair to sa space
-        if (ps_amc.find(tu[index].last_addr) == ps_amc.end()) {
+    } else if (tu[ip].last_addr != addr) { // if not the same addr in a row, add pair to sa space
+        if (ps_amc.find(tu[ip].last_addr) == ps_amc.end()) {
+            if (sa_alloc_counter == sa.size()) {
+                pf_alloc_cnt += 1;
+                sa.insert(sa.end(), sa_chunk.begin(), sa_chunk.end());
+                link_sa_index.push_back(-1);
+            }
             sa[sa_alloc_counter].valid = true;
-            sa[sa_alloc_counter].addr = tu[index].last_addr;
+            sa[sa_alloc_counter].addr = tu[ip].last_addr;
             sa[sa_alloc_counter].counter = 0;
             ps_amc.insert(make_pair(addr, sa_alloc_counter));
             sa[sa_alloc_counter + 1].valid = true;
@@ -99,51 +135,72 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
             ps_amc.insert(make_pair(addr, sa_alloc_counter + 1));
             sa_alloc_counter += SA_CHUNK_SIZE;
         } else {
-            int sa_index = ps_amc.at(tu[index].last_addr);
-            // question: what to do after a chunk is full;
+            long int sa_index = ps_amc.at(tu[ip].last_addr);
+            // a chunk is not full;
             if (sa_index % SA_CHUNK_SIZE != SA_CHUNK_SIZE - 1) {
-                if (sa[sa_index + 1].valid) {
-                    if (sa[sa_index + 1].counter > 0) {
-                        sa[sa_index + 1].counter--;
-                    } else { // replace with the new address
-                        sa[sa_index + 1].addr = addr;
-                    }
-                } else {
-                    sa[sa_index + 1].valid = true;
-                    sa[sa_index + 1].addr = addr;
-                    sa[sa_index + 1].counter = 0;
-                    ps_amc.insert(make_pair(addr, sa_index + 1));
-                }
+                touch(sa_index + 1, addr);
             } else { // allocate new chunk
+                if (link_sa_index[sa_index / SA_CHUNK_SIZE] == -1) {
+                    pf_alloc_blocked_cnt++;
+                    if (sa_alloc_counter == sa.size()) {
+                        sa.insert(sa.end(), sa_chunk.begin(), sa_chunk.end());
+                        link_sa_index.push_back(-1);
+                    }
+                    sa[sa_alloc_counter].valid = true;
+                    sa[sa_alloc_counter].addr = addr;
+                    sa[sa_alloc_counter].counter = 0;
+                    ps_amc.insert(make_pair(addr, sa_alloc_counter));
+                    link_sa_index[sa_index / SA_CHUNK_SIZE] = sa_alloc_counter;
+                    sa_alloc_counter += SA_CHUNK_SIZE;
+                } else {
+                    long int addr_slot = link_sa_index[sa_index / SA_CHUNK_SIZE];
+                    touch(addr_slot, addr);
+                }
             }
         }
     }
 
     // sanity check
     // at this point we should know a matching tracker index
-    if (index == -1)
-        assert(0);
+    // if (index == -1)
+    //     assert(0);
 
     // only do any prefetching if there's a hit in sa space
     if (ps_amc.find(addr) != ps_amc.end()) {
-        int sa_index = ps_amc.at(addr);
+        long int sa_index = ps_amc.at(addr);
         // do some prefetching
+        long int prev_sa_idx = sa_index;
         for (int i=0; i<PREFETCH_DEGREE; i++) {
-            int chunk_offset = sa_index % SA_CHUNK_SIZE;
-            if (chunk_offset + i + 1 < SA_CHUNK_SIZE) {
-                uint64_t pf_address = (sa[sa_index + 1 + i].addr >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE;
+            int chunk_offset = prev_sa_idx % SA_CHUNK_SIZE;
+            if (chunk_offset + 1 < SA_CHUNK_SIZE) {
+                if (sa[prev_sa_idx + 1].valid) {
+                    uint64_t pf_address = (sa[prev_sa_idx + 1].addr >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE;
 
-                // // only issue a prefetch if the prefetch address is in the same 4 KB page 
-                // // as the current demand access address
-                // if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
-                //     break;
+                    // // only issue a prefetch if the prefetch address is in the same 4 KB page 
+                    // // as the current demand access address
+                    // if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    //     break;
 
-                // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
-                if (MSHR.occupancy < (MSHR.SIZE>>1)) prefetch_line(ip, addr, pf_address, FILL_L2, 0);
-                else prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+                    // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+                    // if (MSHR.occupancy < (MSHR.SIZE>>1)) prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+                    // else prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+                    prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+                    prev_sa_idx += 1;
+                }
+            } else {
+                pf_boundary_blocked_cnt++;
+                long int sa_idx_to_fetch = link_sa_index[prev_sa_idx / SA_CHUNK_SIZE];
+                if (sa_idx_to_fetch != -1) {
+                    if (sa[sa_idx_to_fetch].valid) {
+                        uint64_t pf_address = (sa[sa_idx_to_fetch].addr >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE;
+                        prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+                        prev_sa_idx = sa_idx_to_fetch;
+                    }
+                }
             }
         }
     }
+    tu[ip].last_addr = addr;
     return metadata_in;
 }
 
@@ -155,4 +212,6 @@ uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t 
 void CACHE::l2c_prefetcher_final_stats()
 {
     cout << "CPU " << cpu << " L2C ISB final stats" << endl;
+    cout << "sa first time alloc: " << pf_alloc_cnt << " sa creation blocked count: " << pf_alloc_blocked_cnt << " " << "sa query block count: " << pf_boundary_blocked_cnt << endl;
+    cout << "sa size " << sa_alloc_counter << endl;
 }
